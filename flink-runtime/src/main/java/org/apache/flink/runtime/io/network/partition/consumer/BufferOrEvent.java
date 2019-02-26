@@ -36,8 +36,7 @@ public class BufferOrEvent {
 
 	/**
 	 * Indicate availability of further instances for the union input gate.
-	 * This is not needed outside of the input gate unioning logic and cannot
-	 * be set outside of the consumer package.
+	 * This cannot be set outside of the consumer package.
 	 */
 	private boolean moreAvailable;
 
@@ -90,7 +89,7 @@ public class BufferOrEvent {
 		this.channelIndex = channelIndex;
 	}
 
-	boolean moreAvailable() {
+	public boolean moreAvailable() {
 		return moreAvailable;
 	}
 
