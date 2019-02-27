@@ -175,7 +175,7 @@ public class NetworkInput implements Input, InputGateListener {
 				if (!next.isPresent()) {
 					// input exhausted
 					checkState(isFinished);
-					return null;
+					return Optional.empty();
 				}
 			} else {
 				next = inputGate.pollNextBufferOrEvent();
@@ -207,7 +207,7 @@ public class NetworkInput implements Input, InputGateListener {
 					finishedChannels.set(channelIndex);
 					if (finishedChannels.cardinality() == inputGate.getNumberOfInputChannels()) {
 						isFinished = true;
-						return null;
+						return Optional.empty();
 					}
 				}
 			}

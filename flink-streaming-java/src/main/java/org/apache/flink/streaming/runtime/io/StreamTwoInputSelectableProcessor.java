@@ -119,7 +119,8 @@ public class StreamTwoInputSelectableProcessor<IN1, IN2> implements InputListene
 	}
 
 	/**
-	 * Notes that it must be called after calling all operator's open().
+	 * Notes that it must be called after calling all operator's open(). This ensures that
+	 * the first input selection determined by the operator at open and before is valid.
 	 */
 	public void init() {
 		inputSelection = ((TwoInputSelectable) streamOperator).nextSelection();
@@ -133,6 +134,9 @@ public class StreamTwoInputSelectableProcessor<IN1, IN2> implements InputListene
 				numRecordsIn = new SimpleCounter();
 			}
 		}
+
+		input1.registerListener(this);
+		input2.registerListener(this);
 	}
 
 	public boolean processInput() throws Exception {
@@ -173,7 +177,7 @@ public class StreamTwoInputSelectableProcessor<IN1, IN2> implements InputListene
 			}
 
 			// the current input may be finished
-			if (next == null || !next.isPresent()) {
+			if (!next.isPresent()) {
 				if (currentInput.isFinished()) {
 					if (currentInput == input1) {
 						if (streamOperator instanceof BoundedTwoInput) {
