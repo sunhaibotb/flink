@@ -79,6 +79,8 @@ import java.util.concurrent.TimeUnit;
 import scala.concurrent.duration.Deadline;
 import scala.concurrent.duration.FiniteDuration;
 
+import static org.apache.flink.streaming.util.TestUtil.swapArrayElement;
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
@@ -597,7 +599,7 @@ public class OneInputStreamTaskTest extends TestLogger {
 	}
 
 	@Test
-	public void testHandlingEndOfInput() throws Exception {
+	public void testCloseOperatorsGracefully() throws Exception {
 		final OneInputStreamTaskTestHarness<String, String> testHarness = new OneInputStreamTaskTestHarness<>(
 			OneInputStreamTask::new,
 			BasicTypeInfo.STRING_TYPE_INFO,
@@ -611,8 +613,6 @@ public class OneInputStreamTaskTest extends TestLogger {
 				BasicTypeInfo.STRING_TYPE_INFO.createSerializer(new ExecutionConfig()))
 			.finish();
 
-		ConcurrentLinkedQueue<Object> expectedOutput = new ConcurrentLinkedQueue<>();
-
 		testHarness.invoke();
 		testHarness.waitForTaskRunning();
 
@@ -621,15 +621,25 @@ public class OneInputStreamTaskTest extends TestLogger {
 
 		testHarness.waitForTaskCompletion();
 
-		expectedOutput.add(new StreamRecord<>("Hello"));
-		expectedOutput.add(new StreamRecord<>("[Operator0]: EndOfInput"));
-		expectedOutput.add(new StreamRecord<>("[Operator0]: Bye"));
-		expectedOutput.add(new StreamRecord<>("[Operator1]: EndOfInput"));
-		expectedOutput.add(new StreamRecord<>("[Operator1]: Bye"));
+		Object[] expectedOutput = new StreamRecord<?>[] {
+			new StreamRecord<>("Hello"),
+			new StreamRecord<>("[Operator0]: End of input"),
+			new StreamRecord<>("[Operator0]: Timer triggered"),
+			new StreamRecord<>("[Operator0]: Bye"),
+			new StreamRecord<>("[Operator1]: End of input"),
+			new StreamRecord<>("[Operator1]: Timer triggered"),
+			new StreamRecord<>("[Operator1]: Bye")
+		};
 
-		TestHarnessUtil.assertOutputEquals("Output was not correct.",
-			expectedOutput,
-			testHarness.getOutput());
+		Object[] actualOutput = testHarness.getOutput().toArray(new Object[0]);
+		for (int i : new int[] {2, 5}) {
+			@SuppressWarnings("unchecked")
+			boolean needToSwap = !((StreamRecord<String>) actualOutput[i]).getValue().endsWith(": Timer triggered");
+			if (needToSwap) {
+				swapArrayElement(actualOutput, i, i + 1);
+			}
+		}
+		assertArrayEquals(expectedOutput, actualOutput);
 	}
 
 	private static class TestOperator

@@ -19,12 +19,14 @@
 package org.apache.flink.streaming.runtime.tasks;
 
 import org.apache.flink.api.common.ExecutionConfig;
+import org.apache.flink.api.common.time.Time;
 import org.apache.flink.api.common.typeinfo.BasicTypeInfo;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.api.common.typeutils.base.StringSerializer;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.api.java.typeutils.TupleTypeInfo;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.core.testutils.MultiShotLatch;
 import org.apache.flink.runtime.checkpoint.CheckpointMetaData;
 import org.apache.flink.runtime.checkpoint.CheckpointOptions;
 import org.apache.flink.runtime.execution.CancelTaskException;
@@ -38,7 +40,9 @@ import org.apache.flink.streaming.api.graph.StreamConfig;
 import org.apache.flink.streaming.api.operators.BoundedOneInput;
 import org.apache.flink.streaming.api.operators.StreamSource;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
+import org.apache.flink.streaming.runtime.tasks.ProcessingTimeServiceImpl.TimerScheduledFuture;
 import org.apache.flink.streaming.util.TestHarnessUtil;
+import org.apache.flink.streaming.util.TestUtil;
 import org.apache.flink.util.ExceptionUtils;
 
 import org.junit.Assert;
@@ -61,7 +65,9 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicLong;
 
+import static org.apache.flink.streaming.util.TestUtil.swapArrayElement;
 import static org.apache.flink.util.Preconditions.checkState;
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertTrue;
 
 /**
@@ -69,6 +75,8 @@ import static org.junit.Assert.assertTrue;
  * checkpointing/element emission don't occur concurrently.
  */
 public class SourceStreamTaskTest {
+
+	private static final Time timeout = Time.seconds(10L);
 
 	/**
 	 * This test verifies that open() and close() are correctly called by the StreamTask.
@@ -165,7 +173,7 @@ public class SourceStreamTaskTest {
 	}
 
 	@Test
-	public void testMarkingEndOfInput() throws Exception {
+	public void testCloseOperatorsGracefully() throws Exception {
 		final StreamTaskTestHarness<String> testHarness = new StreamTaskTestHarness<>(
 			SourceStreamTask::new,
 			BasicTypeInfo.STRING_TYPE_INFO);
@@ -184,20 +192,28 @@ public class SourceStreamTaskTest {
 		StreamConfig streamConfig = testHarness.getStreamConfig();
 		streamConfig.setTimeCharacteristic(TimeCharacteristic.ProcessingTime);
 
-		ConcurrentLinkedQueue<Object> expectedOutput = new ConcurrentLinkedQueue<>();
-
 		testHarness.invoke();
 		testHarness.waitForTaskCompletion();
 
-		expectedOutput.add(new StreamRecord<>("Hello"));
-		expectedOutput.add(new StreamRecord<>("[Source0]: EndOfInput"));
-		expectedOutput.add(new StreamRecord<>("[Source0]: Bye"));
-		expectedOutput.add(new StreamRecord<>("[Operator1]: EndOfInput"));
-		expectedOutput.add(new StreamRecord<>("[Operator1]: Bye"));
+		Object[] expectedOutput = new StreamRecord<?>[]{
+			new StreamRecord<>("Hello"),
+			new StreamRecord<>("[Source0]: End of input"),
+			new StreamRecord<>("[Source0]: Timer triggered"),
+			new StreamRecord<>("[Source0]: Bye"),
+			new StreamRecord<>("[Operator1]: End of input"),
+			new StreamRecord<>("[Operator1]: Timer triggered"),
+			new StreamRecord<>("[Operator1]: Bye")
+		};
 
-		TestHarnessUtil.assertOutputEquals("Output was not correct.",
-			expectedOutput,
-			testHarness.getOutput());
+		Object[] actualOutput = testHarness.getOutput().toArray(new Object[0]);
+		for (int i : new int[] {2, 5}) {
+			@SuppressWarnings("unchecked")
+			boolean needToSwap = !((StreamRecord<String>) actualOutput[i]).getValue().endsWith(": Timer triggered");
+			if (needToSwap) {
+				swapArrayElement(actualOutput, i, i + 1);
+			}
+		}
+		assertArrayEquals(expectedOutput, actualOutput);
 	}
 
 	@Test
@@ -223,13 +239,17 @@ public class SourceStreamTaskTest {
 		ConcurrentLinkedQueue<Object> expectedOutput = new ConcurrentLinkedQueue<>();
 
 		testHarness.invoke();
-		CancelTestSource.getDataProcessing().get();
+		CancelTestSource.getDataProcessing().await();
 		testHarness.getTask().cancel();
 
 		try {
 			testHarness.waitForTaskCompletion();
 		} catch (Throwable t) {
 			assertTrue(ExceptionUtils.findThrowable(t, CancelTaskException.class).isPresent());
+		}
+
+		for (Object object : testHarness.getOutput()) {
+			System.out.println(object);
 		}
 
 		expectedOutput.add(new StreamRecord<>("Hello"));
@@ -415,9 +435,9 @@ public class SourceStreamTaskTest {
 	private static class CancelTestSource extends FromElementsFunction<String> {
 		private static final long serialVersionUID = 8713065281092996067L;
 
-		private static CompletableFuture<Void> dataProcessing = new CompletableFuture<>();
+		private static MultiShotLatch dataProcessing = new MultiShotLatch();
 
-		private static CompletableFuture<Void> cancellationWaiting = new CompletableFuture<>();
+		private static MultiShotLatch cancellationWaiting = new MultiShotLatch();
 
 		public CancelTestSource(TypeSerializer<String> serializer, String... elements) throws IOException {
 			super(serializer, elements);
@@ -427,18 +447,17 @@ public class SourceStreamTaskTest {
 		public void run(SourceContext<String> ctx) throws Exception {
 			super.run(ctx);
 
-			dataProcessing.complete(null);
-			cancellationWaiting.get();
+			dataProcessing.trigger();
+			cancellationWaiting.await();
 		}
 
 		@Override
 		public void cancel() {
 			super.cancel();
-
-			cancellationWaiting.complete(null);
+			cancellationWaiting.trigger();
 		}
 
-		public static CompletableFuture<Void> getDataProcessing() {
+		public static MultiShotLatch getDataProcessing() {
 			return dataProcessing;
 		}
 	}
@@ -494,13 +513,27 @@ public class SourceStreamTaskTest {
 		}
 
 		@Override
-		public void endInput() {
-			output.collect(new StreamRecord<>("[" + name + "]: EndOfInput"));
+		public void endInput() throws Exception {
+			output("[" + name + "]: End of input");
+
+			TimerScheduledFuture<?> timer = registerProcessingTimeTimer(0, t -> output("[" + name + "]: Timer triggered"));
+			TestUtil.waitCondition((deadline) -> !timer.isPending(), timeout);
 		}
 
 		@Override
-		public void close() {
-			output.collect(new StreamRecord<>("[" + name + "]: Bye"));
+		public void close() throws Exception {
+			getProcessingTimeService().registerTimer(0, t -> output("[" + name + "]: Timer not triggered"));
+
+			output("[" + name + "]: Bye");
+			super.close();
+		}
+
+		private void output(String record) {
+			output.collect(new StreamRecord<>(record));
+		}
+
+		private TimerScheduledFuture<?> registerProcessingTimeTimer(long timestamp, ProcessingTimeCallback callback) {
+			return (TimerScheduledFuture<?>) getProcessingTimeService().registerTimer(timestamp, callback);
 		}
 	}
 }

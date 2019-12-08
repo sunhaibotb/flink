@@ -48,7 +48,6 @@ import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.streaming.runtime.io.StreamTwoInputProcessor;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.streaming.runtime.streamstatus.StreamStatus;
-import org.apache.flink.streaming.util.TestBoundedTwoInputOperator;
 import org.apache.flink.streaming.util.TestHarnessUtil;
 
 import org.junit.Assert;
@@ -59,6 +58,8 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
+import static org.apache.flink.streaming.util.TestUtil.swapArrayElement;
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 
 /**
@@ -573,7 +574,7 @@ public class TwoInputStreamTaskTest {
 	}
 
 	@Test
-	public void testHandlingEndOfInput() throws Exception {
+	public void testCloseOperatorsGracefully() throws Exception {
 		final TwoInputStreamTaskTestHarness<String, String, String> testHarness = new TwoInputStreamTaskTestHarness<>(
 			TwoInputStreamTask::new,
 			BasicTypeInfo.STRING_TYPE_INFO,
@@ -590,8 +591,6 @@ public class TwoInputStreamTaskTest {
 				BasicTypeInfo.STRING_TYPE_INFO.createSerializer(new ExecutionConfig()))
 			.finish();
 
-		ConcurrentLinkedQueue<Object> expectedOutput = new ConcurrentLinkedQueue<>();
-
 		testHarness.invoke();
 		testHarness.waitForTaskRunning();
 
@@ -605,17 +604,27 @@ public class TwoInputStreamTaskTest {
 
 		testHarness.waitForTaskCompletion();
 
-		expectedOutput.add(new StreamRecord<>("[Operator0-1]: Hello-1"));
-		expectedOutput.add(new StreamRecord<>("[Operator0-1]: EndOfInput"));
-		expectedOutput.add(new StreamRecord<>("[Operator0-2]: Hello-2"));
-		expectedOutput.add(new StreamRecord<>("[Operator0-2]: EndOfInput"));
-		expectedOutput.add(new StreamRecord<>("[Operator0]: Bye"));
-		expectedOutput.add(new StreamRecord<>("[Operator1]: EndOfInput"));
-		expectedOutput.add(new StreamRecord<>("[Operator1]: Bye"));
+		Object[] expectedOutput = new StreamRecord<?>[]{
+			new StreamRecord<>("[Operator0-1]: Hello-1"),
+			new StreamRecord<>("[Operator0-1]: End of input"),
+			new StreamRecord<>("[Operator0-2]: Hello-2"),
+			new StreamRecord<>("[Operator0-2]: End of input"),
+			new StreamRecord<>("[Operator0]: Timer triggered"),
+			new StreamRecord<>("[Operator0]: Bye"),
+			new StreamRecord<>("[Operator1]: End of input"),
+			new StreamRecord<>("[Operator1]: Timer triggered"),
+			new StreamRecord<>("[Operator1]: Bye")
+		};
 
-		TestHarnessUtil.assertOutputEquals("Output was not correct.",
-			expectedOutput,
-			testHarness.getOutput());
+		Object[] actualOutput = testHarness.getOutput().toArray(new Object[0]);
+		for (int i : new int[] {4, 7}) {
+			@SuppressWarnings("unchecked")
+			boolean needToSwap = !((StreamRecord<String>) actualOutput[i]).getValue().endsWith(": Timer triggered");
+			if (needToSwap) {
+				swapArrayElement(actualOutput, i, i + 1);
+			}
+		}
+		assertArrayEquals(expectedOutput, actualOutput);
 	}
 
 	// This must only be used in one test, otherwise the static fields will be changed

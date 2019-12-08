@@ -485,14 +485,14 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>>
 	private void afterInvoke() throws Exception {
 		LOG.debug("Finished task {}", getName());
 
+		// close all operators in the chain effect way. closing happens from head to tail
+		// operator in the chain, contrary to StreamOperator#open() which happens tail to head.
+		// (see #initializeStateAndOpen()).
+		operatorChain.getHeadOperatorWrapper().close(this, true);
+
 		// make sure no further checkpoint and notification actions happen.
-		// we make sure that no other thread is currently in the locked scope before
-		// we close the operators by trying to acquire the checkpoint scope lock
-		// we also need to make sure that no triggers fire concurrently with the close logic
 		// at the same time, this makes sure that during any "regular" exit where still
 		actionExecutor.runThrowing(() -> {
-			// this is part of the main logic, so if this fails, the task is considered failed
-			closeAllOperators();
 
 			// make sure no new timers can come
 			timerService.quiesce();
@@ -597,35 +597,6 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>>
 
 	public final boolean isCanceled() {
 		return canceled;
-	}
-
-	/**
-	 * Execute {@link StreamOperator#close()} of each operator in the chain of this
-	 * {@link StreamTask}. Closing happens from <b>head to tail</b> operator in the chain,
-	 * contrary to {@link StreamOperator#open()} which happens <b>tail to head</b>
-	 * (see {@link #initializeStateAndOpen()}).
-	 */
-	private void closeAllOperators() throws Exception {
-		// We need to close them first to last, since upstream operators in the chain might emit
-		// elements in their close methods.
-		Iterator<StreamOperatorWrapper<?, ?>> it = operatorChain.getOperatorIterator();
-		boolean isHeadOperator = true;
-		while (it.hasNext()) {
-			StreamOperator<?> operator = it.next().getStreamOperator();
-
-			// The operators on the chain, except for the head operator, must be one-input operators.
-			// So after the upstream operator on the chain is closed, the input of its downstream operator
-			// reaches the end.
-			if (!isHeadOperator) {
-				operatorChain.endNonHeadOperatorInput(operator);
-			} else {
-				isHeadOperator = false;
-			}
-
-			if (operator != null) {
-				operator.close();
-			}
-		}
 	}
 
 	private void shutdownAsyncThreads() throws Exception {
@@ -983,7 +954,6 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>>
 	 * Execute {@link StreamOperator#initializeState()} followed by {@link StreamOperator#open()} of each operator in
 	 * the chain of this {@link StreamTask}. State initialization and opening happens from <b>tail to head</b> operator
 	 * in the chain, contrary to {@link StreamOperator#close()} which happens <b>head to tail</b>
-	 * (see {@link #closeAllOperators()}.
 	 */
 	private void initializeStateAndOpen() throws Exception {
 		Iterator<StreamOperatorWrapper<?, ?>> it = operatorChain.getOperatorReverseIterator();

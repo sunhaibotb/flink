@@ -40,8 +40,6 @@ import org.apache.flink.streaming.api.collector.selector.DirectedOutput;
 import org.apache.flink.streaming.api.collector.selector.OutputSelector;
 import org.apache.flink.streaming.api.graph.StreamConfig;
 import org.apache.flink.streaming.api.graph.StreamEdge;
-import org.apache.flink.streaming.api.operators.BoundedMultiInput;
-import org.apache.flink.streaming.api.operators.BoundedOneInput;
 import org.apache.flink.streaming.api.operators.InputSelectable;
 import org.apache.flink.streaming.api.operators.MailboxExecutor;
 import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
@@ -272,26 +270,7 @@ public class OperatorChain<OUT, OP extends StreamOperator<OUT>> implements Strea
 	 * @param inputId the input ID starts from 1 which indicates the first input.
 	 */
 	public void endHeadOperatorInput(int inputId) throws Exception {
-		endOperatorInput(getHeadOperator(), inputId);
-	}
-
-	/**
-	 * Ends all inputs of the non-head operator specified by {@code streamOperator})
-	 * (now there is only one input for each non-head operator).
-	 *
-	 * @param streamOperator non-head operator for ending the only input.
-	 */
-	public void endNonHeadOperatorInput(StreamOperator<?> streamOperator) throws Exception {
-		checkState(streamOperator != getHeadOperator());
-		endOperatorInput(streamOperator, 1);
-	}
-
-	private void endOperatorInput(StreamOperator<?> streamOperator, int inputId) throws Exception {
-		if (streamOperator instanceof BoundedOneInput) {
-			((BoundedOneInput) streamOperator).endInput();
-		} else if (streamOperator instanceof BoundedMultiInput) {
-			((BoundedMultiInput) streamOperator).endInput(inputId);
-		}
+		headOperatorWrapper.endOperatorInput(inputId);
 	}
 
 	public RecordWriterOutput<?>[] getStreamOutputs() {
@@ -314,6 +293,10 @@ public class OperatorChain<OUT, OP extends StreamOperator<OUT>> implements Strea
 
 	public int getNumberOfOperators() {
 		return allOperatorWrappers.size();
+	}
+
+	public StreamOperatorWrapper<OUT, OP> getHeadOperatorWrapper() {
+		return headOperatorWrapper;
 	}
 
 	public MailboxExecutor getOperatorMailboxExecutor(OperatorID operatorID) {

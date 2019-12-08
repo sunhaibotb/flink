@@ -16,12 +16,16 @@
  * limitations under the License.
  */
 
-package org.apache.flink.streaming.util;
+package org.apache.flink.streaming.runtime.tasks;
 
+import org.apache.flink.api.common.time.Time;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
 import org.apache.flink.streaming.api.operators.BoundedMultiInput;
+import org.apache.flink.streaming.api.operators.InputSelection;
 import org.apache.flink.streaming.api.operators.TwoInputStreamOperator;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
+import org.apache.flink.streaming.runtime.tasks.ProcessingTimeServiceImpl.TimerScheduledFuture;
+import org.apache.flink.streaming.util.TestUtil;
 
 /**
  * A test operator class implementing {@link BoundedMultiInput}.
@@ -31,10 +35,15 @@ public class TestBoundedTwoInputOperator extends AbstractStreamOperator<String>
 
 	private static final long serialVersionUID = 1L;
 
+	private static final Time timeout = Time.seconds(10L);
+
 	private final String name;
+
+	private InputSelection finishedInputs;
 
 	public TestBoundedTwoInputOperator(String name) {
 		this.name = name;
+		this.finishedInputs = new InputSelection.Builder().build();
 	}
 
 	@Override
@@ -48,13 +57,30 @@ public class TestBoundedTwoInputOperator extends AbstractStreamOperator<String>
 	}
 
 	@Override
-	public void endInput(int inputId) {
-		output.collect(new StreamRecord<>("[" + name + "-" + inputId + "]: EndOfInput"));
+	public void endInput(int inputId) throws Exception {
+		finishedInputs = InputSelection.Builder.from(finishedInputs).select(inputId).build();
+
+		output("[" + name + "-" + inputId + "]: End of input");
+
+		if (finishedInputs.isALLMaskOf2()) {
+			TimerScheduledFuture<?> timer = registerProcessingTimeTimer(0, t -> output("[" + name + "]: Timer triggered"));
+			TestUtil.waitCondition((deadline) -> !timer.isPending(), timeout);
+		}
 	}
 
 	@Override
 	public void close() throws Exception {
+		getProcessingTimeService().registerTimer(0, t -> output("[" + name + "]: Timer not triggered"));
+
 		output.collect(new StreamRecord<>("[" + name + "]: Bye"));
 		super.close();
+	}
+
+	private void output(String record) {
+		output.collect(new StreamRecord<>(record));
+	}
+
+	private TimerScheduledFuture<?> registerProcessingTimeTimer(long timestamp, ProcessingTimeCallback callback) {
+		return (TimerScheduledFuture<?>) getProcessingTimeService().registerTimer(timestamp, callback);
 	}
 }

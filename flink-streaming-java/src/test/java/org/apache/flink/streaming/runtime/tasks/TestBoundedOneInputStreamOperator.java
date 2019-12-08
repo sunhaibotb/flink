@@ -18,10 +18,13 @@
 
 package org.apache.flink.streaming.runtime.tasks;
 
+import org.apache.flink.api.common.time.Time;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
 import org.apache.flink.streaming.api.operators.BoundedOneInput;
 import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
+import org.apache.flink.streaming.runtime.tasks.ProcessingTimeServiceImpl.TimerScheduledFuture;
+import org.apache.flink.streaming.util.TestUtil;
 
 /**
  * A bounded one-input stream operator for test.
@@ -30,6 +33,8 @@ public class TestBoundedOneInputStreamOperator extends AbstractStreamOperator<St
 	implements OneInputStreamOperator<String, String>, BoundedOneInput {
 
 	private static final long serialVersionUID = 1L;
+
+	private static final Time timeout = Time.seconds(10L);
 
 	private final String name;
 
@@ -43,13 +48,26 @@ public class TestBoundedOneInputStreamOperator extends AbstractStreamOperator<St
 	}
 
 	@Override
-	public void endInput() {
-		output.collect(new StreamRecord<>("[" + name + "]: EndOfInput"));
+	public void endInput() throws Exception {
+		output("[" + name + "]: End of input");
+
+		TimerScheduledFuture<?> timer = registerProcessingTimeTimer(0, t -> output("[" + name + "]: Timer triggered"));
+		TestUtil.waitCondition((deadline) -> !timer.isPending(), timeout);
 	}
 
 	@Override
 	public void close() throws Exception {
-		output.collect(new StreamRecord<>("[" + name + "]: Bye"));
+		getProcessingTimeService().registerTimer(0, t -> output("[" + name + "]: Timer not triggered"));
+
+		output("[" + name + "]: Bye");
 		super.close();
+	}
+
+	private void output(String record) {
+		output.collect(new StreamRecord<>(record));
+	}
+
+	private TimerScheduledFuture<?> registerProcessingTimeTimer(long timestamp, ProcessingTimeCallback callback) {
+		return (TimerScheduledFuture<?>) getProcessingTimeService().registerTimer(timestamp, callback);
 	}
 }
