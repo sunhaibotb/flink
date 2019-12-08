@@ -67,7 +67,7 @@ class BoundedStreamTask<IN, OUT, OP extends OneInputStreamOperator<IN, OUT> & Bo
 	@Override
 	protected void init() throws Exception {
 		Preconditions.checkState(
-			operatorChain.getAllOperators().length == 1,
+			operatorChain.getNumberOfOperators() == 1,
 			"BoundedStreamTask's should only run a single operator");
 
 		// re-initialize the operator with the correct collector.

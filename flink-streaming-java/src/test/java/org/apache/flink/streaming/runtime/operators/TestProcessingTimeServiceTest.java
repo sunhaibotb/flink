@@ -55,8 +55,10 @@ public class TestProcessingTimeServiceTest {
 		streamConfig.setOperatorID(new OperatorID());
 
 		testHarness.invoke();
+		testHarness.waitForTaskRunning();
 
-		ProcessingTimeService processingTimeService = testHarness.getTask().getProcessingTimeService(0);
+		ProcessingTimeService processingTimeService = testHarness.getTask()
+			.getProcessingTimeService(testHarness.getHeadOperator().getOperatorID());
 
 		assertEquals(Long.MIN_VALUE, processingTimeService.getCurrentProcessingTime());
 

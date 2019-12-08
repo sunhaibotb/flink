@@ -154,6 +154,10 @@ public class StreamTaskTestHarness<OUT> {
 		return taskThread.task.getTimerService();
 	}
 
+	public StreamOperator<?> getHeadOperator() {
+		return taskThread.task.getHeadOperator();
+	}
+
 	/**
 	 * This must be overwritten for OneInputStreamTask or TwoInputStreamTask test harnesses.
 	 */

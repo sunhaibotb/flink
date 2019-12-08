@@ -85,6 +85,7 @@ import javax.annotation.Nullable;
 import java.io.Closeable;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.OptionalLong;
@@ -607,18 +608,22 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>>
 	private void closeAllOperators() throws Exception {
 		// We need to close them first to last, since upstream operators in the chain might emit
 		// elements in their close methods.
-		StreamOperator<?>[] allOperators = operatorChain.getAllOperators();
-		for (int i = allOperators.length - 1; i >= 0; i--) {
-			StreamOperator<?> operator = allOperators[i];
-			if (operator != null) {
-				operator.close();
-			}
+		Iterator<StreamOperatorWrapper<?, ?>> it = operatorChain.getOperatorIterator();
+		boolean isHeadOperator = true;
+		while (it.hasNext()) {
+			StreamOperator<?> operator = it.next().getStreamOperator();
 
 			// The operators on the chain, except for the head operator, must be one-input operators.
 			// So after the upstream operator on the chain is closed, the input of its downstream operator
 			// reaches the end.
-			if (i > 0) {
-				operatorChain.endNonHeadOperatorInput(allOperators[i - 1]);
+			if (!isHeadOperator) {
+				operatorChain.endNonHeadOperatorInput(operator);
+			} else {
+				isHeadOperator = false;
+			}
+
+			if (operator != null) {
+				operator.close();
 			}
 		}
 	}
@@ -635,7 +640,9 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>>
 	 */
 	private void disposeAllOperators(boolean logOnlyErrors) throws Exception {
 		if (operatorChain != null && !disposedOperators) {
-			for (StreamOperator<?> operator : operatorChain.getAllOperators()) {
+			Iterator<StreamOperatorWrapper<?, ?>> it = operatorChain.getOperatorReverseIterator();
+			while (it.hasNext()) {
+				StreamOperator<?> operator = it.next().getStreamOperator();
 				if (operator == null) {
 					continue;
 				}
@@ -910,7 +917,9 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>>
 				if (isRunning) {
 					LOG.debug("Notification of complete checkpoint for task {}", getName());
 
-					for (StreamOperator<?> operator : operatorChain.getAllOperators()) {
+					Iterator<StreamOperatorWrapper<?, ?>> it = operatorChain.getOperatorReverseIterator();
+					while (it.hasNext()) {
+						StreamOperator<?> operator = it.next().getStreamOperator();
 						if (operator != null) {
 							operator.notifyCheckpointComplete(checkpointId);
 						}
@@ -977,10 +986,9 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>>
 	 * (see {@link #closeAllOperators()}.
 	 */
 	private void initializeStateAndOpen() throws Exception {
-
-		StreamOperator<?>[] allOperators = operatorChain.getAllOperators();
-
-		for (StreamOperator<?> operator : allOperators) {
+		Iterator<StreamOperatorWrapper<?, ?>> it = operatorChain.getOperatorReverseIterator();
+		while (it.hasNext()) {
+			StreamOperator<?> operator = it.next().getStreamOperator();
 			if (null != operator) {
 				operator.initializeState();
 				operator.open();
@@ -1011,10 +1019,25 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>>
 		return timerService;
 	}
 
-	public ProcessingTimeService getProcessingTimeService(int operatorIndex) {
+	@VisibleForTesting
+	StreamOperator<?> getHeadOperator() {
+		return operatorChain.getHeadOperator();
+	}
+
+	public ProcessingTimeService getProcessingTimeService(OperatorID operatorID) {
+		Preconditions.checkNotNull(operatorID);
 		Preconditions.checkState(timerService != null, "The timer service has not been initialized.");
-		MailboxExecutor mailboxExecutor = mailboxProcessor.getMailboxExecutor(operatorIndex);
-		return new ProcessingTimeServiceImpl(timerService, callback -> deferCallbackToMailbox(mailboxExecutor, callback));
+		Preconditions.checkState(operatorChain != null, "operatorChain has not been initialized.");
+
+		ProcessingTimeService processingTimeService = operatorChain.getOperatorProcessingTimeService(operatorID);
+		if (processingTimeService == null) {
+			processingTimeService = new ProcessingTimeServiceImpl(
+				timerService,
+				callback -> deferCallbackToMailbox(operatorChain.getOperatorMailboxExecutor(operatorID), callback));
+			operatorChain.setOperatorProcessingTimeService(operatorID, (ProcessingTimeServiceImpl) processingTimeService);
+		}
+
+		return processingTimeService;
 	}
 
 	/**
@@ -1300,7 +1323,7 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>>
 		private final CheckpointMetrics checkpointMetrics;
 		private final CheckpointStreamFactory storageLocation;
 
-		private final StreamOperator<?>[] allOperators;
+		private final OperatorChain<?, ?> operatorChain;
 
 		private long startSyncPartNano;
 		private long startAsyncPartNano;
@@ -1321,16 +1344,17 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>>
 			this.checkpointOptions = Preconditions.checkNotNull(checkpointOptions);
 			this.checkpointMetrics = Preconditions.checkNotNull(checkpointMetrics);
 			this.storageLocation = Preconditions.checkNotNull(checkpointStorageLocation);
-			this.allOperators = owner.operatorChain.getAllOperators();
-			this.operatorSnapshotsInProgress = new HashMap<>(allOperators.length);
+			this.operatorChain = owner.operatorChain;
+			this.operatorSnapshotsInProgress = new HashMap<>(operatorChain.getNumberOfOperators());
 		}
 
 		public void executeCheckpointing() throws Exception {
 			startSyncPartNano = System.nanoTime();
 
 			try {
-				for (StreamOperator<?> op : allOperators) {
-					checkpointStreamOperator(op);
+				Iterator<StreamOperatorWrapper<?, ?>> it = operatorChain.getOperatorReverseIterator();
+				while (it.hasNext()) {
+					checkpointStreamOperator(it.next().getStreamOperator());
 				}
 
 				if (LOG.isDebugEnabled()) {
@@ -1482,7 +1506,8 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>>
 		handleAsyncException("Caught exception while processing timer.", new TimerException(ex));
 	}
 
-	private ProcessingTimeCallback deferCallbackToMailbox(MailboxExecutor mailboxExecutor, ProcessingTimeCallback callback) {
+	@VisibleForTesting
+	ProcessingTimeCallback deferCallbackToMailbox(MailboxExecutor mailboxExecutor, ProcessingTimeCallback callback) {
 		return timestamp -> {
 			mailboxExecutor.execute(
 				() -> invokeProcessingTimeCallback(callback, timestamp),

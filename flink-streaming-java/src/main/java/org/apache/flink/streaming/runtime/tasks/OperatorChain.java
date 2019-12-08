@@ -30,6 +30,7 @@ import org.apache.flink.runtime.io.network.api.CancelCheckpointMarker;
 import org.apache.flink.runtime.io.network.api.CheckpointBarrier;
 import org.apache.flink.runtime.io.network.api.writer.RecordWriter;
 import org.apache.flink.runtime.io.network.api.writer.RecordWriterDelegate;
+import org.apache.flink.runtime.jobgraph.OperatorID;
 import org.apache.flink.runtime.metrics.MetricNames;
 import org.apache.flink.runtime.metrics.groups.OperatorIOMetricGroup;
 import org.apache.flink.runtime.metrics.groups.OperatorMetricGroup;
@@ -42,6 +43,7 @@ import org.apache.flink.streaming.api.graph.StreamEdge;
 import org.apache.flink.streaming.api.operators.BoundedMultiInput;
 import org.apache.flink.streaming.api.operators.BoundedOneInput;
 import org.apache.flink.streaming.api.operators.InputSelectable;
+import org.apache.flink.streaming.api.operators.MailboxExecutor;
 import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
 import org.apache.flink.streaming.api.operators.Output;
 import org.apache.flink.streaming.api.operators.StreamOperator;
@@ -67,6 +69,7 @@ import javax.annotation.Nullable;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
@@ -86,16 +89,15 @@ public class OperatorChain<OUT, OP extends StreamOperator<OUT>> implements Strea
 
 	private static final Logger LOG = LoggerFactory.getLogger(OperatorChain.class);
 
-	/**
-	 * Stores all operators on this chain in reverse order.
-	 */
-	private final StreamOperator<?>[] allOperators;
+	private final HashMap<OperatorID, StreamOperatorWrapper<?, ?>> allOperatorWrappers;
 
 	private final RecordWriterOutput<?>[] streamOutputs;
 
 	private final WatermarkGaugeExposingOutput<StreamRecord<OUT>> chainEntryPoint;
 
-	private final OP headOperator;
+	private final StreamOperatorWrapper<OUT, OP> headOperatorWrapper;
+
+	private final StreamOperatorWrapper<?, ?> tailOperatorWrapper;
 
 	/**
 	 * Current status of the input stream of the operator chain.
@@ -140,16 +142,17 @@ public class OperatorChain<OUT, OP extends StreamOperator<OUT>> implements Strea
 			}
 
 			// we create the chain of operators and grab the collector that leads into the chain
-			List<StreamOperator<?>> allOps = new ArrayList<>(chainedConfigs.size());
+			List<StreamOperatorWrapper<?, ?>> allOpWrappers = new ArrayList<>(chainedConfigs.size());
 			this.chainEntryPoint = createOutputCollector(
 				containingTask,
 				configuration,
 				chainedConfigs,
 				userCodeClassloader,
 				streamOutputMap,
-				allOps,
+				allOpWrappers,
 				containingTask.getMailboxExecutorFactory());
 
+			OP headOperator = null;
 			if (operatorFactory != null) {
 				WatermarkGaugeExposingOutput<StreamRecord<OUT>> output = getChainEntryPoint();
 
@@ -160,14 +163,18 @@ public class OperatorChain<OUT, OP extends StreamOperator<OUT>> implements Strea
 						output);
 
 				headOperator.getMetricGroup().gauge(MetricNames.IO_CURRENT_OUTPUT_WATERMARK, output.getWatermarkGauge());
-			} else {
-				headOperator = null;
 			}
 
 			// add head operator to end of chain
-			allOps.add(headOperator);
+			this.headOperatorWrapper = new StreamOperatorWrapper<>(
+				headOperator,
+				containingTask.getMailboxExecutorFactory().createExecutor(configuration.getChainIndex()));
+			allOpWrappers.add(headOperatorWrapper);
 
-			this.allOperators = allOps.toArray(new StreamOperator<?>[allOps.size()]);
+			this.tailOperatorWrapper = allOpWrappers.get(0);
+
+			this.allOperatorWrappers = new HashMap<>();
+			initOperatorWrappers(allOpWrappers);
 
 			success = true;
 		}
@@ -186,15 +193,34 @@ public class OperatorChain<OUT, OP extends StreamOperator<OUT>> implements Strea
 
 	@VisibleForTesting
 	OperatorChain(
-			StreamOperator<?>[] allOperators,
+			List<StreamOperatorWrapper<?, ?>> allOperatorWrappers,
 			RecordWriterOutput<?>[] streamOutputs,
 			WatermarkGaugeExposingOutput<StreamRecord<OUT>> chainEntryPoint,
-			OP headOperator) {
+			StreamOperatorWrapper<OUT, OP> headOperatorWrapper) {
 
-		this.allOperators = checkNotNull(allOperators);
 		this.streamOutputs = checkNotNull(streamOutputs);
 		this.chainEntryPoint = checkNotNull(chainEntryPoint);
-		this.headOperator = checkNotNull(headOperator);
+
+		checkState(allOperatorWrappers != null && allOperatorWrappers.size() > 0);
+		this.headOperatorWrapper = headOperatorWrapper;
+		this.tailOperatorWrapper = allOperatorWrappers.get(0);
+
+		this.allOperatorWrappers = new HashMap<>();
+		initOperatorWrappers(allOperatorWrappers);
+	}
+
+	private void initOperatorWrappers(List<StreamOperatorWrapper<?, ?>> allOperatorWrappers) {
+		int size = allOperatorWrappers.size();
+		for (int i = 0; i < size; i++) {
+			StreamOperatorWrapper operatorWrapper = allOperatorWrappers.get(i);
+			operatorWrapper.setPrevious(i < (size - 1) ? allOperatorWrappers.get(i + 1) : null);
+			operatorWrapper.setNext(i > 0 ? allOperatorWrappers.get(i - 1) : null);
+
+			StreamOperator<?> operator = operatorWrapper.getStreamOperator();
+			if (operator != null) {
+				this.allOperatorWrappers.put(operator.getOperatorID(), operatorWrapper);
+			}
+		}
 	}
 
 	@Override
@@ -231,9 +257,9 @@ public class OperatorChain<OUT, OP extends StreamOperator<OUT>> implements Strea
 	public void prepareSnapshotPreBarrier(long checkpointId) throws Exception {
 		// go forward through the operator chain and tell each operator
 		// to prepare the checkpoint
-		final StreamOperator<?>[] operators = this.allOperators;
-		for (int i = operators.length - 1; i >= 0; --i) {
-			final StreamOperator<?> op = operators[i];
+		Iterator<StreamOperatorWrapper<?, ?>> it = getOperatorIterator();
+		while (it.hasNext()) {
+			final StreamOperator<?> op = it.next().getStreamOperator();
 			if (op != null) {
 				op.prepareSnapshotPreBarrier(checkpointId);
 			}
@@ -246,7 +272,7 @@ public class OperatorChain<OUT, OP extends StreamOperator<OUT>> implements Strea
 	 * @param inputId the input ID starts from 1 which indicates the first input.
 	 */
 	public void endHeadOperatorInput(int inputId) throws Exception {
-		endOperatorInput(headOperator, inputId);
+		endOperatorInput(getHeadOperator(), inputId);
 	}
 
 	/**
@@ -256,7 +282,7 @@ public class OperatorChain<OUT, OP extends StreamOperator<OUT>> implements Strea
 	 * @param streamOperator non-head operator for ending the only input.
 	 */
 	public void endNonHeadOperatorInput(StreamOperator<?> streamOperator) throws Exception {
-		checkState(streamOperator != headOperator);
+		checkState(streamOperator != getHeadOperator());
 		endOperatorInput(streamOperator, 1);
 	}
 
@@ -272,8 +298,34 @@ public class OperatorChain<OUT, OP extends StreamOperator<OUT>> implements Strea
 		return streamOutputs;
 	}
 
-	public StreamOperator<?>[] getAllOperators() {
-		return allOperators;
+	/**
+	 * Returns an iterator traversing operators in topological order.
+	 */
+	public Iterator<StreamOperatorWrapper<?, ?>> getOperatorIterator() {
+		return new StreamOperatorWrapper.ReadIterator(headOperatorWrapper);
+	}
+
+	/**
+	 * Returns an iterator traversing operators in reverse topological order.
+	 */
+	public Iterator<StreamOperatorWrapper<?, ?>> getOperatorReverseIterator() {
+		return new StreamOperatorWrapper.ReverseReadIterator(tailOperatorWrapper);
+	}
+
+	public int getNumberOfOperators() {
+		return allOperatorWrappers.size();
+	}
+
+	public MailboxExecutor getOperatorMailboxExecutor(OperatorID operatorID) {
+		return allOperatorWrappers.get(operatorID).getMailboxExecutor();
+	}
+
+	public ProcessingTimeService getOperatorProcessingTimeService(OperatorID operatorID) {
+		return allOperatorWrappers.get(operatorID).getProcessingTimeService();
+	}
+
+	public void setOperatorProcessingTimeService(OperatorID operatorID, ProcessingTimeServiceImpl processingTimeService) {
+		allOperatorWrappers.get(operatorID).setProcessingTimeService(processingTimeService);
 	}
 
 	public WatermarkGaugeExposingOutput<StreamRecord<OUT>> getChainEntryPoint() {
@@ -307,16 +359,13 @@ public class OperatorChain<OUT, OP extends StreamOperator<OUT>> implements Strea
 	}
 
 	public OP getHeadOperator() {
-		return headOperator;
-	}
-
-	public int getChainLength() {
-		return allOperators == null ? 0 : allOperators.length;
+		return headOperatorWrapper.getStreamOperator();
 	}
 
 	public boolean hasSelectiveReadingOperator() {
-		for (StreamOperator operator : allOperators) {
-			if (operator instanceof InputSelectable) {
+		Iterator<StreamOperatorWrapper<?, ?>> it = getOperatorIterator();
+		while (it.hasNext()) {
+			if (it.next().getStreamOperator() instanceof InputSelectable) {
 				return true;
 			}
 		}
@@ -333,7 +382,7 @@ public class OperatorChain<OUT, OP extends StreamOperator<OUT>> implements Strea
 			Map<Integer, StreamConfig> chainedConfigs,
 			ClassLoader userCodeClassloader,
 			Map<StreamEdge, RecordWriterOutput<?>> streamOutputs,
-			List<StreamOperator<?>> allOperators,
+			List<StreamOperatorWrapper<?, ?>> allOperatorWrappers,
 			MailboxExecutorFactory mailboxExecutorFactory) {
 		List<Tuple2<WatermarkGaugeExposingOutput<StreamRecord<T>>, StreamEdge>> allOutputs = new ArrayList<>(4);
 
@@ -356,7 +405,7 @@ public class OperatorChain<OUT, OP extends StreamOperator<OUT>> implements Strea
 				chainedConfigs,
 				userCodeClassloader,
 				streamOutputs,
-				allOperators,
+				allOperatorWrappers,
 				outputEdge.getOutputTag(),
 				mailboxExecutorFactory);
 			allOutputs.add(new Tuple2<>(output, outputEdge));
@@ -412,7 +461,7 @@ public class OperatorChain<OUT, OP extends StreamOperator<OUT>> implements Strea
 			Map<Integer, StreamConfig> chainedConfigs,
 			ClassLoader userCodeClassloader,
 			Map<StreamEdge, RecordWriterOutput<?>> streamOutputs,
-			List<StreamOperator<?>> allOperators,
+			List<StreamOperatorWrapper<?, ?>> allOperatorWrappers,
 			OutputTag<IN> outputTag,
 			MailboxExecutorFactory mailboxExecutorFactory) {
 		// create the output that the operator writes to first. this may recursively create more operators
@@ -422,7 +471,7 @@ public class OperatorChain<OUT, OP extends StreamOperator<OUT>> implements Strea
 			chainedConfigs,
 			userCodeClassloader,
 			streamOutputs,
-			allOperators,
+			allOperatorWrappers,
 			mailboxExecutorFactory);
 
 		// now create the operator and give it the output collector to write its output to
@@ -432,7 +481,9 @@ public class OperatorChain<OUT, OP extends StreamOperator<OUT>> implements Strea
 				operatorConfig,
 				chainedOperatorOutput);
 
-		allOperators.add(chainedOperator);
+		allOperatorWrappers.add(new StreamOperatorWrapper<>(
+			chainedOperator,
+			containingTask.getMailboxExecutorFactory().createExecutor(operatorConfig.getChainIndex())));
 
 		WatermarkGaugeExposingOutput<StreamRecord<IN>> currentOperatorOutput;
 		if (containingTask.getExecutionConfig().isObjectReuseEnabled()) {

@@ -36,6 +36,7 @@ import org.apache.flink.streaming.api.operators.StreamMap;
 import org.apache.flink.streaming.api.operators.StreamOperator;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.streaming.runtime.tasks.OperatorChain;
+import org.apache.flink.streaming.runtime.tasks.StreamOperatorWrapper;
 import org.apache.flink.streaming.runtime.tasks.StreamTask;
 import org.apache.flink.streaming.util.MockStreamTaskBuilder;
 
@@ -44,6 +45,7 @@ import org.junit.Test;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Iterator;
 import java.util.List;
 
 import static org.hamcrest.MatcherAssert.assertThat;
@@ -133,7 +135,9 @@ public class StreamOperatorChainingTest {
 
 			headOperator.setup(mockTask, streamConfig, operatorChain.getChainEntryPoint());
 
-			for (StreamOperator<?> operator : operatorChain.getAllOperators()) {
+			Iterator<StreamOperatorWrapper<?, ?>> it = operatorChain.getOperatorReverseIterator();
+			while (it.hasNext()) {
+				StreamOperator<?> operator = it.next().getStreamOperator();
 				if (operator != null) {
 					operator.open();
 				}
@@ -254,7 +258,9 @@ public class StreamOperatorChainingTest {
 
 			headOperator.setup(mockTask, streamConfig, operatorChain.getChainEntryPoint());
 
-			for (StreamOperator<?> operator : operatorChain.getAllOperators()) {
+			Iterator<StreamOperatorWrapper<?, ?>> it = operatorChain.getOperatorReverseIterator();
+			while (it.hasNext()) {
+				StreamOperator<?> operator = it.next().getStreamOperator();
 				if (operator != null) {
 					operator.open();
 				}
